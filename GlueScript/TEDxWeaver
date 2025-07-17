@@ -1,0 +1,118 @@
+import sys
+from pyspark.sql.functions import col, collect_list, struct, count, lit, when, size, collect_set, udf, explode, trim, round, lower
+from itertools import combinations
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# ===================================
+# IMPOSTAZIONI INIZIALI E CONNESSIONE
+# ===================================
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+S3_BUCKET_PATH = "s3://tedx-2025-data-ro/" 
+
+DB_NAME = "tedx_weaver_db"
+
+ ==========================
+ LETTURA DEI DATASET DA S3
+ ==========================
+JOIN_KEY = 'id'
+df_final_list = spark.read.option("header","true").csv(S3_BUCKET_PATH + "final_list.csv")
+df_details = spark.read.option("header","true").csv(S3_BUCKET_PATH + "details.csv")
+df_images = spark.read.option("header","true").csv(S3_BUCKET_PATH + "images.csv")
+df_related_videos = spark.read.option("header","true").csv(S3_BUCKET_PATH + "related_videos.csv")
+df_tags = spark.read.option("header","true").csv(S3_BUCKET_PATH + "tags.csv")
+
+ ========================================
+ 1. PREPARAZIONE DELLA COLLECTION 'talks'
+ ========================================
+
+images_agg = df_images.groupBy(JOIN_KEY).agg(collect_list(col("url")).alias("images"))
+tags_agg = df_tags.groupBy(JOIN_KEY).agg(collect_list(col("tag")).alias("tags"))
+videos_agg = df_related_videos.groupBy(JOIN_KEY).agg(
+    collect_list(
+        struct(
+            col("title").alias("video_title"), col("duration").alias("video_duration"),
+            col("viewedCount").alias("video_views"), col("presenterDisplayName").alias("video_speaker")
+        )
+    ).alias("related_videos")
+)
+talks_df = df_final_list.join(df_details, JOIN_KEY, "left").join(images_agg, JOIN_KEY, "left").join(videos_agg, JOIN_KEY, "left").join(tags_agg, JOIN_KEY, "left").withColumnRenamed(JOIN_KEY, "_id")
+talks_final_df = talks_df.select(
+    col("_id"), col("title"), col("presenterDisplayName").alias("speaker"),
+    col("publishedAt").alias("date"), col("duration"), col("url"),
+    col("description"), col("images"), col("related_videos"), col("tags")
+)
+
+ ============================================
+ 2. PREPARAZIONE DELLA COLLECTION 'tag_graph'
+ ============================================
+talk_tags_df = talks_final_df.select(col("_id"), col("tags")).dropna(subset=["tags"])
+combination_schema = ArrayType(StructType([StructField("source", StringType(), False), StructField("target", StringType(), False)]))
+@udf(combination_schema)
+def get_tag_combinations(tags):
+    if tags is None or len(tags) < 2: return []
+    sorted_tags = sorted(list(set(tags)))
+    return [{"source": combo[0], "target": combo[1]} for combo in combinations(sorted_tags, 2)]
+tag_pairs_df = talk_tags_df.withColumn("tag_pairs", get_tag_combinations(col("tags"))).select(explode(col("tag_pairs")).alias("pair"))
+tag_graph_df = tag_pairs_df.groupBy("pair.source", "pair.target").agg(count(lit(1)).alias("weight"))
+
+ ===================================================
+ 3. PREPARAZIONE DELLA COLLECTION 'speaker_profiles'
+ ===================================================
+
+base_profiles_df = talks_final_df.filter(
+    col("speaker").isNotNull() & (trim(col("speaker")) != "") & (lower(trim(col("speaker"))) != "null")
+)
+speaker_talks_agg = base_profiles_df.groupBy("speaker").agg(
+    collect_list(struct(col("_id"), col("title"))).alias("talks")
+)
+speaker_tags_analysis = base_profiles_df.withColumn("tag_exploded", explode(col("tags"))).groupBy("speaker").agg(
+    collect_set("tag_exploded").alias("unique_tags_list"),
+    count("tag_exploded").alias("total_tags_count")
+).withColumn("unique_tags_count", size(col("unique_tags_list"))).withColumn(
+    "specialization_score",
+    round(
+        when(col("total_tags_count") > 0, col("unique_tags_count") / col("total_tags_count")).otherwise(0),
+        3
+    )
+)
+final_speaker_profiles_df = speaker_talks_agg.join(
+    speaker_tags_analysis,
+    "speaker",
+    "inner"
+).withColumnRenamed("speaker", "_id")
+
+ ========================
+ 4. SCRITTURA SU MONGODB
+ ========================
+write_mongo_options = {
+    "uri": MONGO_URI, "database": DB_NAME, "collection": "",
+    "ssl": "true", "ssl.domain_match": "false"
+}
+
+ Scrittura della collection 'talks'
+write_mongo_options["collection"] = "talks"
+talks_final_df.write.format("com.mongodb.spark.sql.DefaultSource").mode("overwrite").options(**write_mongo_options).save()
+print(f"Collection 'talks' scritta con successo nel database '{DB_NAME}'.")
+
+ Scrittura della collection 'tag_graph'
+write_mongo_options["collection"] = "tag_graph"
+tag_graph_df.write.format("com.mongodb.spark.sql.DefaultSource").mode("overwrite").options(**write_mongo_options).save()
+print(f"Collection 'tag_graph' scritta con successo nel database '{DB_NAME}'.")
+
+ Scrittura della collection 'speaker_profiles'
+write_mongo_options["collection"] = "speaker_profiles"
+final_speaker_profiles_df.write.format("com.mongodb.spark.sql.DefaultSource").mode("overwrite").options(**write_mongo_options).save()
+print(f"Collection 'speaker_profiles' scritta con successo nel database '{DB_NAME}'.")
+
+job.commit()
