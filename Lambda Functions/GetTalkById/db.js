@@ -2,7 +2,6 @@ const mongoose = require('mongoose');
 mongoose.Promise = global.Promise;
 let isConnected;
 
-// NOTA: In produzione useremo le variabili d'ambiente della Lambda
 const DB_URL = process.env.DB; 
 const DB_NAME = "tedx_weaver_db";
 
